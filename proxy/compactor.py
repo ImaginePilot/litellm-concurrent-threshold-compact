@@ -52,6 +52,11 @@ SUM_MAXTOK = int(os.environ.get("COMPACTOR_SUM_MAXTOK", "2500"))
 SUM_MODEL  = os.environ.get("COMPACTOR_SUM_MODEL", "qwen3.8-flash-next")
 LOG        = os.environ.get("COMPACTOR_LOG", "/tmp/compactor2.jsonl")
 PASSTHRU   = os.environ.get("COMPACTOR_PASSTHROUGH_SUFFIX", "-raw")
+# Minimum number of leading messages held out of every compacted span. The real
+# boundary is dynamic (the first assistant turn, see head_end) and on KimiCode 2.3.3
+# that is 4; this only raises the floor and is then snapped forward to a legal
+# boundary. 2 = system prompt + task, which is the paper's stated reset target.
+MIN_HEAD   = int(os.environ.get("COMPACTOR_MIN_HEAD", "2"))
 CHARS_PER_TOK = 3.4
 
 app = FastAPI()
@@ -77,6 +82,22 @@ def fp_of(msgs):
     base = msgs[:2] if len(msgs) >= 2 else msgs
     return hashlib.sha256(json.dumps(base,ensure_ascii=False,sort_keys=True).encode()).hexdigest()[:16]
 
+def legal_boundary(msgs, i):
+    """True if the history may be split immediately BEFORE msgs[i].
+
+    Illegal in exactly two cases: msgs[i] is a tool result (it would be orphaned
+    from the assistant that requested it), or msgs[i-1] is an assistant carrying
+    tool_calls (its results would be severed). Both produce a message array the
+    upstream rejects. This was duplicated inside safe_cut; head_end needs the same
+    predicate, so there is now one copy.
+    """
+    if i <= 0 or i >= len(msgs): return True
+    m = msgs[i]
+    if m.get("role") == "tool" or m.get("tool_call_id"): return False
+    prev = msgs[i-1]
+    if prev.get("role") == "assistant" and prev.get("tool_calls"): return False
+    return True
+
 def safe_cut(msgs, start, keep_tokens):
     """Largest i>start where msgs[i:] >= keep_tokens and cutting at i orphans nothing."""
     acc = 0; i = len(msgs)
@@ -84,10 +105,7 @@ def safe_cut(msgs, start, keep_tokens):
         i -= 1
         acc += est(msgs[i])
         if acc < keep_tokens: continue
-        m = msgs[i]
-        if m.get("role") == "tool" or m.get("tool_call_id"): continue
-        prev = msgs[i-1] if i >= 1 else {}
-        if prev.get("role") == "assistant" and prev.get("tool_calls"): continue
+        if not legal_boundary(msgs, i): continue
         return i
     return None
 
@@ -117,7 +135,12 @@ async def summarise(span, client, prompt=SYS_P):
                          + json.dumps(span, ensure_ascii=False)[:400000]}],
             "max_tokens":SUM_MAXTOK,"temperature":0.0,"stream":False}
     r = await client.post(f"{UPSTREAM}/chat/completions", json=body, timeout=600.0)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        # raise_for_status throws away the body, which is the only place the reason
+        # lives. 21 of 41 background compactions failed as an opaque 400.
+        raise RuntimeError("upstream %d: %s (user_chars=%d)"
+                           % (r.status_code, r.text[:400],
+                              len(body["messages"][1]["content"])))
     j = r.json(); ch = j["choices"][0]; m = ch["message"]
     content = (m.get("content") or "").strip()
     # NEVER fall back to reasoning_content. When the budget runs out mid-thought the model
@@ -129,6 +152,63 @@ async def summarise(span, client, prompt=SYS_P):
                            % (ch.get("finish_reason"), len(m.get("reasoning_content") or "")))
     return content
 
+def preamble_floor(msgs):
+    """Leading contiguous run of system/developer messages, plus the first user
+    message after it.
+
+    This is a STRUCTURAL floor under head_end, so that the system prompt and the
+    task survive on any harness even when an assistant turn appears earlier than
+    expected - a harness that few-shot primes with example assistant turns before
+    the real task would otherwise put the first assistant message at index 2 and
+    the dynamic rule would cut the preamble short. Role-agnostic beyond the two
+    spellings used for instructions ("system" and OpenAI's newer "developer").
+    """
+    i = 0
+    while i < len(msgs) and msgs[i].get("role") in ("system", "developer"):
+        i += 1
+    if i < len(msgs) and msgs[i].get("role") == "user":
+        i += 1           # the task
+    return i
+
+def head_end(msgs):
+    """Index where the conversation proper begins = the first assistant turn.
+
+    Everything before it is PREAMBLE and must survive compaction verbatim: the
+    system prompt, the task, and the <system-reminder> user messages the harness
+    injects once at the head. Measured on KimiCode 2.3.3, 2026-11-15: msgs[0] is
+    the system prompt with AGENTS.md already merged into it (10,781 chars from a
+    directory with no AGENTS.md, 12,873 with the global one in scope), msgs[1] is
+    the task, and msgs[2..3] are <system-reminder> blocks carrying the date and
+    the auto-permission-mode rules ("Continue normally without pausing for
+    approval prompts", "Do NOT call AskUserQuestion").
+
+    v2 preserved only msgs[0] plus msgs[1], so index 2 onward was the FIRST thing
+    handed to the summariser - the standing directives came back as third-person
+    prose or disappeared entirely. That is the reported "it does not remember
+    AGENTS.md-level system prompts". The paper's regimes reset to "the system
+    prompt, task, and this recap"; on a real harness the system prompt is spread
+    across several leading messages, so the reset boundary is the first assistant
+    turn, not a fixed index.
+    """
+    h = len(msgs)
+    for i, m in enumerate(msgs):
+        if m.get("role") == "assistant":
+            # Floor at 1: msgs[0] is sacred even in the pathological case of a
+            # transcript that opens on an assistant turn, where i would be 0 and
+            # an empty head would drop the system prompt that v2 always kept.
+            h = max(i, 1)
+            break
+
+    # MIN_HEAD raises the floor for a harness that primes with an early assistant
+    # turn before the real task, which would otherwise cut the preamble short.
+    # It is a FLOOR, never a fixed count: a raw count can land between an assistant
+    # carrying tool_calls and its results, and rebuild() would then splice the recap
+    # pair into that gap and the request would be rejected. Snap forward instead.
+    h = max(h, preamble_floor(msgs), min(MIN_HEAD, len(msgs)))
+    while h < len(msgs) and not legal_boundary(msgs, h):
+        h += 1
+    return h
+
 def rebuild(msgs, trunk, cut):
     """[system] + [task verbatim] + [ordered recaps] + [raw tail].
 
@@ -136,11 +216,10 @@ def rebuild(msgs, trunk, cut):
     "the system prompt, task, and this recap", and a task that has been through a
     summariser is the one loss the agent cannot recover by re-reading the repo.
     """
-    if not trunk or cut <= 2: return msgs
+    h = head_end(msgs)
+    if not trunk or cut <= h: return msgs
     note = "\n\n".join("[recap %d] %s" % (i+1, c) for i, c in enumerate(trunk))
-    head = [msgs[0]]
-    if len(msgs) > 1 and msgs[1].get("role") == "user":
-        head.append(msgs[1])                      # verbatim task
+    head = msgs[:h]                               # system + task + injected reminders
     return (head +
             [{"role":"user","content":"[HANDOFF RECAPS - earlier turns of this session. "
               "Files on disk are authoritative; re-read them rather than trusting detail "
@@ -168,7 +247,8 @@ async def _bg_compact_inner(fp, snapshot, old_cut, new_cut):
     t0 = time.time()
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(900.0, connect=30.0)) as c:
-            span = snapshot[max(2, old_cut):new_cut]   # task (index 1) held out
+            # preamble (system prompt, task, injected reminders) is held out entirely
+            span = snapshot[max(head_end(snapshot), old_cut):new_cut]
             note = await summarise(span, c)
             if not note:
                 STATS["bg_failed"] += 1; return
@@ -220,7 +300,7 @@ async def prepare(payload):
         after = est(out)
         launched = False
         if after > T_TRIGGER and (st["pending"] is None or st["pending"].done()):
-            nc = safe_cut(msgs, max(cut, 2), KEEP_TAIL)
+            nc = safe_cut(msgs, max(cut, head_end(msgs)), KEEP_TAIL)
             if nc and nc > cut:
                 st["pending"] = asyncio.create_task(bg_compact(fp, list(msgs), cut, nc))
                 STATS["bg_launched"] += 1; launched = True
@@ -243,7 +323,8 @@ async def models():
 async def stats():
     s = dict(STATS)
     s.update({"live_conversations":len(STATE),"T":T_TRIGGER,"keep_tail":KEEP_TAIL,"bg_max":BG_MAX,
-              "trunk_max":TRUNK_MAX,"upstream":UPSTREAM,"version":2,
+              "trunk_max":TRUNK_MAX,"upstream":UPSTREAM,"version":3,
+              "min_head":MIN_HEAD,
               "trunks":{k:{"chunks":len(v["trunk"]),"cut":v["cut"],
                            "est":est(v["trunk"])} for k,v in list(STATE.items())[:6]}})
     return JSONResponse(s)

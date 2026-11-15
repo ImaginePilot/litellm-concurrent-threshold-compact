@@ -67,3 +67,56 @@ unconverged rather than medianed.
 A global metrics ring carries every client. Correlating a variable against it mostly measures *which
 client was running*. Attribution by joining to a per-request log with client identity, plus
 stratifying **within** each client, is the minimum before claiming a relationship.
+
+## 9. The preamble is several messages, not one — compacting from index 2 silently deletes standing directives
+
+`rebuild()` originally preserved `msgs[0]` (system) plus `msgs[1]` (the task) and fed
+everything from index 2 into the summariser. On a real harness that is wrong.
+
+Measured on KimiCode 2.3.3, 2026-11-15, by sniffing the actual HTTP bodies:
+
+| index | role | content |
+|---|---|---|
+| 0 | `system` | base system prompt **with AGENTS.md already merged in** — 10,781 chars from a directory with no AGENTS.md, 12,873 with the global one in scope |
+| 1 | `user` | the task |
+| 2 | `user` | `<system-reminder>` — today's date |
+| 3 | `user` | `<system-reminder>` — auto-permission mode: *"Continue normally without pausing for approval prompts"*, *"Do NOT call AskUserQuestion"* |
+| 4+ | `assistant`/`tool` | the conversation proper |
+
+Indices 2–3 are **system-prompt-level standing directives delivered as user
+messages**, injected once at the head and never repeated. Compaction fed them to the
+summariser as the first thing in the span, so they came back as third-person prose
+("the agent was told to continue without approval") or vanished — and the agent lost
+its autonomy settings and its sense of the date mid-session. The reported symptom was
+"it does not remember AGENTS.md-level system prompts".
+
+Note what was *not* broken: AGENTS.md itself survived the whole time, because the
+harness merges it into `msgs[0]`. The lost content was its neighbours. A plausible
+diagnosis pointed at the wrong message.
+
+**Fix:** the reset boundary is the **first `assistant` turn**, not a fixed index.
+Everything before it is preamble and is preserved verbatim; the span starts at it.
+
+```python
+def head_end(msgs):
+    for i, m in enumerate(msgs):
+        if m.get("role") == "assistant":
+            return max(i, 1)   # floor: msgs[0] is sacred
+    return len(msgs)
+```
+
+The paper's regimes reset to "the system prompt, task, and this recap"
+(arXiv:2611.05306 §3). On a real harness "the system prompt" is spread across several
+leading messages, so a fixed index cannot express that boundary — only the first
+assistant turn can.
+
+Verified end-to-end by chaining the proxy through a body-logging sniffer: after a real
+compaction (28,538 → 12,113 prompt tokens) the forwarded array is
+`system, task, reminder, reminder, [recaps], assistant…` and the summariser's span
+begins at the first assistant turn.
+
+**Instrument note:** the sniffer initially stored only the first 300 chars of each
+message, which reported the AGENTS.md marker as absent — including on the
+*uncompacted* passthrough request, where it provably was not. A marker search must run
+over the full content, and a sentinel that reads absent on the control arm is an
+instrument bug, not a finding.

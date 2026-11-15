@@ -85,8 +85,13 @@ any file. Six sections, following the paper's published prompt: Objective / Esta
 paths and symbols; observations separated from unverified ideas) / Applied changes (and whether
 verified) / Verification / **Dead ends** / Remaining plan.
 
-The task is held out of every compacted span and replayed **verbatim**, matching the paper's reset to
-"the system prompt, task, and this recap".
+The whole **preamble** is held out of every compacted span and replayed **verbatim**, matching the
+paper's reset to "the system prompt, task, and this recap". On a real harness that reset target is
+not one or two messages: KimiCode 2.3.3 puts the system prompt (with AGENTS.md merged in) at index 0,
+the task at index 1, and `<system-reminder>` blocks carrying the date and the auto-permission rules at
+indices 2-3, injected once at the head and never repeated. So the boundary is computed, not fixed —
+it is the **first `assistant` turn**, because before the model has spoken nothing can be conversation
+history. See pitfall 9; preserving only indices 0-1 silently deleted the standing directives.
 
 What re-reading *cannot* recover is what the brief must carry: dead ends (a rejected approach leaves
 no trace on disk), verified-vs-merely-applied, the task's completion conditions, and the next action.
